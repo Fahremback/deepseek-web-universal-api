@@ -1,0 +1,37 @@
+# Python, editor and OS-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+
+# Local binaries and intermediate paper previews
+ds_pow_solver
+ds_pow_solver.exe
+paper/_*.png
+
+# Never publish captured traffic or local authentication material
+.env
+.env.*
+*.har
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+*.log
+credentials.json
+secrets.json
+session.json
+auth.json
+*.pem
+*.key
+
+# IDE and temporary files
+.idea/
+.vscode/
+*.tmp
+*.bak
