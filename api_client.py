@@ -1637,6 +1637,12 @@ class DeepSeekClient:
                         raise DeepSeekAPIError(
                             f"DeepSeek closed generation with non-terminal status: {acc.status or 'unknown'}"
                         )
+                    if acc.closed and acc.status == "FINISHED" and (
+                        acc.text != acc._emitted_text or acc.thinking != acc._emitted_thinking
+                    ):
+                        raise DeepSeekAPIError(
+                            "DeepSeek final response diverged from previously streamed content"
+                        )
                     title = acc.title if acc.title != before_title else None
                     if delta_text or delta_think or title or acc.closed or event in ("ready", "title"):
                         yield StreamChunk(
@@ -1648,6 +1654,10 @@ class DeepSeekClient:
                             done=acc.closed and (acc.status != "INCOMPLETE" or not auto_continue),
                             raw=data,
                         )
+                    if acc.closed:
+                        # Ignore any trailing close marker after [DONE]. A
+                        # logical generation has exactly one terminal event.
+                        break
                 if not acc.closed:
                     raise DeepSeekAPIError("DeepSeek SSE stream ended without a close event")
                 if acc.status != "INCOMPLETE" or not auto_continue:

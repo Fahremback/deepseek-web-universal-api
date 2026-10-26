@@ -89,6 +89,21 @@ data: [DONE]
         self.assertEqual([chunk.done for chunk in chunks if chunk.done], [True])
         client.session.close()
 
+    def test_done_followed_by_close_emits_only_one_terminal_chunk(self):
+        finished = '''data: {"v":{"response":{"message_id":2,"status":"FINISHED","fragments":[{"type":"RESPONSE","content":"complete"}]}}}
+
+data: [DONE]
+
+event: close
+data: {}
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(finished), CompletionAccumulator())):
+            chunks = list(client.stream_completion(chat_session_id="session", prompt="short"))
+        self.assertEqual(sum(chunk.done for chunk in chunks), 1)
+        client.session.close()
+
     def test_incomplete_done_marker_continues_and_emits_final_done(self):
         initial = INITIAL.replace("event: close\ndata: {}", "data: [DONE]")
         finished = CONTINUED.replace("event: close\ndata: {}", "data: [DONE]")
@@ -196,6 +211,25 @@ data: {}
                 chunks = list(client.stream_completion(chat_session_id="session", prompt="long"))
         self.assertEqual("".join(c.text for c in chunks), "Parte final")
         self.assertEqual(client.last_accumulator.text, "Parte final")
+        client.session.close()
+
+    def test_final_rewrite_must_not_silently_disagree_with_streamed_text(self):
+        rewritten = '''data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[{"type":"RESPONSE","content":"Outra resposta"}]}}}
+
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
+
+event: close
+data: {}
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(INITIAL), CompletionAccumulator())):
+            with patch.object(client, "continue_completion_stream", return_value=FakeSSE(rewritten)):
+                chunks = []
+                with self.assertRaisesRegex(DeepSeekAPIError, "diverg"):
+                    for chunk in client.stream_completion(chat_session_id="session", prompt="long"):
+                        chunks.append(chunk)
+        self.assertFalse(any(chunk.done for chunk in chunks))
         client.session.close()
 
     def test_continue_cap_does_not_report_success(self):
