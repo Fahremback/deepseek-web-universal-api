@@ -15,6 +15,17 @@ o DeepSeek Web e encerra o gateway local ao sair. Para um comando direto,
 use `python run_codex.py`. Não é necessário alterar a configuração global do
 Codex. É necessário manter a sessão do DeepSeek válida.
 
+**API para qualquer harness compatível com OpenAI/Anthropic no Windows:**
+abra `Abrir API DeepSeek.cmd` com dois cliques e mantenha a janela aberta.
+Configure o programa cliente com a base URL OpenAI
+`http://127.0.0.1:8000/v1` (ou Anthropic `http://127.0.0.1:8000`) e o
+modelo `deepseek-web`. Os dois atalhos usam a mesma sessão DeepSeek salva,
+mas executam servidores locais independentes. Se um aplicativo exigir um campo
+de chave API, poderá utilizar um marcador local; por padrão, a API se limita
+à interface de loopback e **não exige autenticação local**. Para protegê-la
+com uma chave, defina `DEEPSEEK_BRIDGE_API_KEY` antes de iniciá-la e configure
+a mesma chave no cliente. Não exponha a porta 8000 à rede pública.
+
 ```powershell
 git clone https://github.com/Fahremback/deepseek-web-universal-api.git
 cd deepseek-web-universal-api
