@@ -63,6 +63,38 @@ data: {}
 
 
 class AutoContinueTests(unittest.TestCase):
+    def test_close_while_still_generating_does_not_complete(self):
+        partial = '''event: ready
+data: {"request_message_id":1,"response_message_id":2}
+
+data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[{"type":"RESPONSE","content":"partial"}]}}}
+
+event: close
+data: {}
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(partial), CompletionAccumulator())):
+            chunks = []
+            with self.assertRaisesRegex(DeepSeekAPIError, "WIP"):
+                for chunk in client.stream_completion(chat_session_id="session", prompt="long"):
+                    chunks.append(chunk)
+        self.assertFalse(any(chunk.done for chunk in chunks))
+        client.session.close()
+
+    def test_failed_status_does_not_complete(self):
+        failed = '''data: {"v":{"response":{"message_id":2,"status":"FAILED","fragments":[{"type":"RESPONSE","content":"partial"}]}}}
+
+event: close
+data: {}
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(failed), CompletionAccumulator())):
+            with self.assertRaisesRegex(DeepSeekAPIError, "FAILED"):
+                list(client.stream_completion(chat_session_id="session", prompt="long"))
+        client.session.close()
+
     def test_final_status_overrides_stale_incomplete_quasi_status(self):
         acc = CompletionAccumulator()
         acc.feed("message", '{"v":{"response":{"status":"WIP","fragments":[]}}}')

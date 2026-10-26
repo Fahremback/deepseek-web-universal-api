@@ -93,6 +93,7 @@ Para testar `/continue` é preciso obter uma geração suficientemente longa par
 - Não duplicar prefixos após replay/reset de `/continue`.
 - Não perder texto quando um novo fragmento `RESPONSE` sucede `THINK`.
 - Em `INCOMPLETE`, repetir `/continue` automaticamente até `FINISHED` ou erro explícito.
+- Rejeitar `close` SSE com status `WIP`, `FAILED` ou ausente, sem sinalizar resposta concluída.
 - Emitir `done` uma vez, no sucesso.
 - Preservar `session_id`, `request_message_id` e `response_message_id`.
 - Calcular PoW específico do endpoint de upload, aguardar `SUCCESS` e incluir novos IDs junto dos `ref_file_ids` existentes.

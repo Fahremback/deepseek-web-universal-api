@@ -1633,6 +1633,10 @@ class DeepSeekClient:
                 for event, data in iter_sse(resp.iter_lines(chunk_size=1024)):
                     before_title = acc.title
                     delta_text, delta_think = acc.feed(event, data)
+                    if event == "close" and acc.status not in ("FINISHED", "INCOMPLETE"):
+                        raise DeepSeekAPIError(
+                            f"DeepSeek closed generation with non-terminal status: {acc.status or 'unknown'}"
+                        )
                     title = acc.title if acc.title != before_title else None
                     if delta_text or delta_think or title or event in ("ready", "title", "close"):
                         yield StreamChunk(
