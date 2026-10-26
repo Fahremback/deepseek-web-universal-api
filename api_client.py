@@ -757,7 +757,7 @@ class CompletionAccumulator:
         quasi = self.response.get("quasi_status") if isinstance(self.response, dict) else None
         # The final status field is authoritative. A stale quasi_status can
         # otherwise keep a finished continuation stuck in INCOMPLETE.
-        if status in ("FINISHED", "INCOMPLETE"):
+        if status in ("FINISHED", "INCOMPLETE", "FAILED"):
             self.status = status
         elif isinstance(quasi, str) and quasi:
             self.status = quasi

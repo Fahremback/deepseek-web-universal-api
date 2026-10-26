@@ -168,6 +168,23 @@ data: {}
                 list(client.stream_completion(chat_session_id="session", prompt="long"))
         client.session.close()
 
+    def test_failed_status_overrides_stale_incomplete_quasi_status(self):
+        failed = '''data: {"v":{"response":{"message_id":2,"status":"WIP","quasi_status":"INCOMPLETE","fragments":[{"type":"RESPONSE","content":"partial"}]}}}
+
+data: {"p":"response/status","o":"SET","v":"FAILED"}
+
+event: close
+data: {}
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(failed), CompletionAccumulator())):
+            with patch.object(client, "continue_completion_stream") as continuation:
+                with self.assertRaisesRegex(DeepSeekAPIError, "FAILED"):
+                    list(client.stream_completion(chat_session_id="session", prompt="long"))
+        continuation.assert_not_called()
+        client.session.close()
+
     def test_final_status_overrides_stale_incomplete_quasi_status(self):
         acc = CompletionAccumulator()
         acc.feed("message", '{"v":{"response":{"status":"WIP","fragments":[]}}}')
