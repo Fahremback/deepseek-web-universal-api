@@ -674,11 +674,14 @@ class CompletionAccumulator:
             idx = self._index(container, segment)
             if idx is None:
                 return
-            if idx < 0:
-                idx = 0
-            while len(container) <= idx:
-                container.append(None)
-            container[idx] = value
+            # Sparse indices from a broken SSE patch must not allocate an
+            # unbounded number of placeholder entries.
+            if idx < 0 or idx > len(container):
+                raise DeepSeekAPIError("DeepSeek SSE array index is out of bounds")
+            if idx == len(container):
+                container.append(value)
+            else:
+                container[idx] = value
         elif isinstance(container, dict):
             container[segment] = value
 

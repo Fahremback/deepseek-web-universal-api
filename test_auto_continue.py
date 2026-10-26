@@ -80,6 +80,16 @@ data: {}
                 list(client.stream_completion(chat_session_id="session", prompt="test"))
         client.session.close()
 
+    def test_sparse_sse_array_index_is_rejected_without_allocating_gaps(self):
+        acc = CompletionAccumulator()
+        acc.feed("message", '{"v":{"response":{"status":"WIP","fragments":[{"type":"RESPONSE","content":"ok"}]}}}')
+        for invalid_index in ("7", "999999999", "-20"):
+            with self.subTest(index=invalid_index), self.assertRaisesRegex(DeepSeekAPIError, "index"):
+                acc.feed("message", '{"p":"response/fragments/' + invalid_index + '/content","o":"SET","v":"bad"}')
+        self.assertEqual(len(acc.response["fragments"]), 1)
+        self.assertEqual(acc.text, "ok")
+
+
     def test_done_marker_with_nonterminal_status_is_rejected(self):
         partial = '''data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[{"type":"RESPONSE","content":"partial"}]}}}
 
