@@ -820,7 +820,9 @@ class CompletionAccumulator:
 
         try:
             obj = json.loads(data)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            if event == "message":
+                raise DeepSeekAPIError("DeepSeek SSE message contains malformed JSON") from exc
             return ("", "")
 
         if not isinstance(obj, dict):

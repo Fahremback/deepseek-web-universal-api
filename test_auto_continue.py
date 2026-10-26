@@ -63,6 +63,23 @@ data: {}
 
 
 class AutoContinueTests(unittest.TestCase):
+    def test_corrupt_message_patch_is_not_silently_ignored(self):
+        corrupt = '''data: {"v":{"response":{"status":"WIP","fragments":[{"type":"RESPONSE","content":"part"}]}}}
+
+data: {"p":"response/fragments/-1/content","v":"tail"
+
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
+
+event: close
+data: {}
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(corrupt), CompletionAccumulator())):
+            with self.assertRaisesRegex(DeepSeekAPIError, "malformed|invalid|JSON"):
+                list(client.stream_completion(chat_session_id="session", prompt="test"))
+        client.session.close()
+
     def test_done_marker_with_nonterminal_status_is_rejected(self):
         partial = '''data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[{"type":"RESPONSE","content":"partial"}]}}}
 
