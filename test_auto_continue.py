@@ -52,8 +52,24 @@ data: {}
 
 """
 
+CONTINUED_WITH_STALE_QUASI = """data: {"p":"response/quasi_status","o":"SET","v":"INCOMPLETE"}
+
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
+
+event: close
+data: {}
+
+"""
+
 
 class AutoContinueTests(unittest.TestCase):
+    def test_final_status_overrides_stale_incomplete_quasi_status(self):
+        acc = CompletionAccumulator()
+        acc.feed("message", '{"v":{"response":{"status":"WIP","fragments":[]}}}')
+        acc.feed("message", '{"p":"response/quasi_status","o":"SET","v":"INCOMPLETE"}')
+        acc.feed("message", '{"p":"response/status","o":"SET","v":"FINISHED"}')
+        self.assertEqual(acc.status, "FINISHED")
+
     def test_thinking_to_response_switch_keeps_implicit_content_path(self):
         acc = CompletionAccumulator()
         acc.feed("message", '{"v":{"response":{"status":"WIP","fragments":[{"type":"THINK","content":"Thought"}]}}}')
@@ -87,6 +103,17 @@ class AutoContinueTests(unittest.TestCase):
         self.assertTrue(chunks[-1].done)
         self.assertEqual(client.last_accumulator.status, "INCOMPLETE")
         continuation.assert_not_called()
+        client.session.close()
+
+    def test_continuation_stops_on_final_status_even_with_stale_quasi(self):
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(INITIAL), CompletionAccumulator())):
+            with patch.object(client, "continue_completion_stream", return_value=FakeSSE(CONTINUED_WITH_STALE_QUASI)) as continuation:
+                chunks = list(client.stream_completion(chat_session_id="session", prompt="long"))
+        self.assertEqual(client.last_accumulator.status, "FINISHED")
+        self.assertEqual(client.last_accumulator.continuations, 1)
+        self.assertTrue(chunks[-1].done)
+        continuation.assert_called_once()
         client.session.close()
 
     def test_replayed_prefix_after_reset_is_not_streamed_twice(self):

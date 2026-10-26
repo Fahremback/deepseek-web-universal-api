@@ -754,11 +754,15 @@ class CompletionAccumulator:
         self.text = self._fragment_text(("RESPONSE",))
         self.thinking = self._fragment_text(("THINK", "THINKING", "REASONING"))
         status = self.response.get("status") if isinstance(self.response, dict) else None
-        if isinstance(status, str):
-            self.status = status
         quasi = self.response.get("quasi_status") if isinstance(self.response, dict) else None
-        if isinstance(quasi, str) and quasi:
+        # The final status field is authoritative. A stale quasi_status can
+        # otherwise keep a finished continuation stuck in INCOMPLETE.
+        if status in ("FINISHED", "INCOMPLETE"):
+            self.status = status
+        elif isinstance(quasi, str) and quasi:
             self.status = quasi
+        elif isinstance(status, str):
+            self.status = status
         delta_text = ""
         if self.text.startswith(self._emitted_text):
             delta_text = self.text[len(self._emitted_text):]
