@@ -1,2 +1,4 @@
 requests>=2.31
 keyring>=25
+playwright>=1.52
+zstandard>=0.23

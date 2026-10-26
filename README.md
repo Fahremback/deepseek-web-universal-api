@@ -34,6 +34,21 @@ O cliente implementa um protocolo HTTP privado do DeepSeek Web; nao e a API publ
 
 ## Servidor OpenAI / Anthropic para harnesses
 
+Para utilizar o **Codex CLI** com o gateway apenas durante a sessão, sem
+modificar `~/.codex/config.toml` e sem instalar um serviço persistente:
+
+```powershell
+python run_codex.py
+python run_codex.py -- exec "Analise este projeto"
+```
+
+O iniciador cria uma chave de API local temporária, escolhe uma porta livre,
+inicia o gateway em `127.0.0.1`, configura o modelo `deepseek-web` e o protocolo
+OpenAI Responses para o processo Codex e encerra o gateway quando o Codex sai.
+É necessário ter o Codex CLI instalado e uma sessão DeepSeek Web autenticada.
+Isso **não** reconfigura o aplicativo Codex Desktop nem mantém um servidor 24/7.
+Veja também [a integração e seus limites](docs/HARNESSES.md).
+
 ```powershell
 python openai_server.py --host 127.0.0.1 --port 8000
 ```
@@ -56,8 +71,42 @@ HTTP and requires no browser at runtime.
 
 ## Authentication
 
-For a computer with an existing authenticated DeepSeek session in Edge or
-Chrome, import it once from local storage using HTTP validation; no browser
+**Recommended: sign in on DeepSeek's real website.** Run:
+
+```powershell
+python api_client.py --login-web
+```
+
+The command first checks for an already authenticated session in **Perplexity
+Comet**, including its secondary profiles. If verified, it imports that session
+without opening a window. Otherwise, it opens **https://chat.deepseek.com/sign_in**
+in the **system default browser**. Log in there normally, including any
+interactive challenge. It validates the token with the same headers as the
+gateway, saves it to the available OS keyring, and reports progress while
+waiting. Offline profile import supports Chromium-based browsers (Comet, Edge,
+Chrome, Brave, Chromium, Vivaldi) on Windows, macOS and Linux when their
+profile format and the local reader are supported.
+The reader does not collect account passwords.
+
+For an optional dedicated browser flow, use `--login-browser msedge`,
+`--login-browser chromium`, `--login-browser firefox` or `--login-browser webkit`.
+The matching Playwright browser binary must be installed first (`python -m playwright install chromium firefox webkit`).
+Each managed browser keeps a persistent profile outside the project folder,
+under the OS user data directory (on Windows, `%LOCALAPPDATA%`; on macOS,
+`~/Library/Application Support`; on Linux, `$XDG_DATA_HOME` or `~/.local/share`).
+The dedicated browser closes after a successful login. The ordinary default
+browser can be opened on any system, but importing an existing session from
+Firefox, Safari or other unrecognized profile formats is not automatic.
+
+If the site invalidates the login later and no account-password login was
+explicitly provisioned, use `--login-web` again to sign in interactively. This
+is not an unattended password login or a way around additional verification.
+On authentication failure, the running HTTP client first checks the credential
+vault, then any configured account login, then tries to import a refreshed
+Comet session before returning an authentication error.
+
+For a computer with an existing authenticated DeepSeek session in a supported
+Chromium-based browser, import it once from local storage using HTTP validation; no browser
 process is started. The session is saved in the operating system's credential
 vault (Windows Credential Manager, macOS Keychain, or supported Linux keyring).
 Later HTTP API calls retrieve it automatically.
@@ -71,9 +120,25 @@ Alternatively, the account owner can provide a bearer token once through
 `DEEPSEEK_TOKEN`, `DEEPSEEK_TOKEN_FILE`, or `--token`. It is persisted after
 the first successful authenticated API call.
 
-No browser is opened or installed by the client. If the site invalidates the
-token, a new account credential is needed; the DeepSeek Web private API does
-not offer this client a verified unattended sign-in flow.
+Normal API requests neither open nor install a browser. For unattended renewal when
+the session token expires, provision the account login once. The password is
+prompted without appearing in command history, then stored in a **separate**
+Windows Credential Manager (OS keyring) entry alongside the session entry:
+
+```powershell
+python api_client.py --login --email "your@email.com"
+python api_client.py --json "Responda apenas OK."
+```
+
+Mobile login is also supported with `--login --mobile NUMBER --area-code CODE`.
+When running without an interactive terminal, explicitly pass `--password-stdin`
+to read the password from standard input; never pass the password as a CLI
+argument. An expired session triggers a single HTTP login at
+`POST https://chat.deepseek.com/api/v0/users/login`, saves the new token in
+the system vault, and retries the failed request at most once. There is no
+separate refresh-token endpoint. This **unofficial private API** can change,
+reject credentials, or require additional challenges; unattended login is not
+guaranteed in those cases. The client will report an authentication error.
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -86,7 +151,8 @@ python api_client.py --json "Responda apenas OK."
 The import helper uses optional offline readers under `deepseek_api/tools/`.
 They are not needed by the HTTP API runtime. No plaintext token file is made.
 
-To remove the saved credential, run `python api_client.py --forget-credentials`.
+To remove the saved token **and saved account login**, run
+`python api_client.py --forget-credentials`.
 
 ## Check
 

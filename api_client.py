@@ -31,18 +31,21 @@ vault and automatically reused on later runs. No browser is required.
     DEEPSEEK_LOCALE         optional, default pt_BR
     DEEPSEEK_TIMEZONE_OFFSET optional, seconds east of UTC
 
-No authenticated login or token-refresh endpoint was observed in the capture.
-When the saved token is revoked, it must be replaced by an account credential.
+Optional HTTP account login at /api/v0/users/login can refresh expired tokens
+using an explicitly saved account login from the Windows credential vault.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import getpass
+import hashlib
 from io import BytesIO
 import json
 import mimetypes
 import os
+import platform
 import shutil
 import struct
 import subprocess
@@ -66,6 +69,7 @@ except ImportError as exc:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://chat.deepseek.com"
+LOGIN_PATH = "/api/v0/users/login"
 POW_PATH = "/api/v0/chat/create_pow_challenge"
 SESSION_CREATE_PATH = "/api/v0/chat_session/create"
 COMPLETION_PATH = "/api/v0/chat/completion"
@@ -92,6 +96,7 @@ USER_AGENT = (
 SEC_CH_UA = '"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"'
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+_AUTH_REFRESH_LOCK = threading.RLock()
 SOLVER_EXE = SCRIPT_DIR / ("ds_pow_solver.exe" if os.name == "nt" else "ds_pow_solver")
 SOLVER_SRC = SCRIPT_DIR / "ds_pow_solver.c"
 
@@ -395,56 +400,82 @@ def deepseek_hash_v1(data: bytes) -> bytes:
 
 _solver_lock = threading.Lock()
 _native_solver_checked = False
+_native_solver_path: Optional[Path] = None
 
 
-def _write_source_if_needed() -> None:
+def _solver_cache_path() -> Path:
+    """Use a per-user, OS/CPU/source-specific cache, not the installed code directory."""
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Caches"
+    else:
+        root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    arch = "".join(c for c in platform.machine().lower() if c.isalnum() or c in "_-") or "unknown"
+    digest = hashlib.sha256(C_SOURCE.encode("utf-8")).hexdigest()[:16]
+    suffix = ".exe" if os.name == "nt" else ""
+    return root / "DeepSeekWebClient" / f"ds_pow_solver-{sys.platform}-{arch}-{digest}{suffix}"
+
+
+def _valid_native_solver(path: Path) -> bool:
+    """Reject stale, corrupt or wrong-platform binaries before using them."""
     try:
-        current = SOLVER_SRC.read_text(encoding="utf-8") if SOLVER_SRC.exists() else None
-    except OSError:
-        current = None
-    if current != C_SOURCE:
-        try:
-            SOLVER_SRC.write_text(C_SOURCE, encoding="utf-8")
-        except OSError:
-            pass
+        result = subprocess.run(
+            [str(path), "solve", KNOWN_POW["challenge"], KNOWN_POW["salt"],
+             str(KNOWN_POW["expire_at"]), str(KNOWN_POW["difficulty"])],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0 and result.stdout.strip() == str(KNOWN_POW["answer"])
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _ensure_native_solver() -> Optional[Path]:
-    """Return a working native solver path, compiling it on first use if needed."""
-    global _native_solver_checked
+    """Reuse a verified solver or compile portable C in the user's cache."""
+    global _native_solver_checked, _native_solver_path
     with _solver_lock:
-        if SOLVER_EXE.exists():
-            return SOLVER_EXE
         if _native_solver_checked:
-            return None
+            return _native_solver_path
         _native_solver_checked = True
-
-        _write_source_if_needed()
-        if not SOLVER_SRC.exists():
+        if SOLVER_EXE.is_file() and _valid_native_solver(SOLVER_EXE):
+            _native_solver_path = SOLVER_EXE
+            return _native_solver_path
+        cache = _solver_cache_path()
+        if cache.is_file() and _valid_native_solver(cache):
+            _native_solver_path = cache
+            return _native_solver_path
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            source = cache.with_suffix(".c")
+            if not source.exists() or source.read_text(encoding="utf-8") != C_SOURCE:
+                source.write_text(C_SOURCE, encoding="utf-8")
+        except OSError:
             return None
-
-        compilers = ["gcc", "clang", "cc"]
-        tmp = SOLVER_EXE.with_name(SOLVER_EXE.name + ".tmp")
-        for compiler in compilers:
+        # -march=native would bake the build machine's CPU features into a
+        # binary reused on subsequent machines, so compile generic C instead.
+        for compiler in ("gcc", "clang", "cc"):
             exe = shutil.which(compiler)
             if not exe:
                 continue
-            for extra in (["-O3", "-march=native"], ["-O3"], []):
-                cmd = [exe, *extra, "-o", str(tmp), str(SOLVER_SRC)]
+            for extra in (["-O3"], []):
+                tmp = cache.with_name(cache.name + f".{os.getpid()}.tmp")
+                cmd = [exe, *extra, "-o", str(tmp), str(source)]
                 try:
                     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
                 except (OSError, subprocess.SubprocessError):
                     continue
                 if proc.returncode == 0 and tmp.exists():
                     try:
-                        os.replace(tmp, SOLVER_EXE)
+                        os.replace(tmp, cache)
                     except OSError:
                         try:
                             tmp.unlink()
                         except OSError:
                             pass
-                        return None
-                    return SOLVER_EXE
+                        continue
+                    if _valid_native_solver(cache):
+                        _native_solver_path = cache
+                        return _native_solver_path
                 try:
                     tmp.unlink()
                 except OSError:
@@ -502,13 +533,18 @@ def solve_pow(challenge: dict[str, Any], *, verbose: bool = False) -> int:
             out = proc.stdout.strip()
             if proc.returncode == 0 and out:
                 answer = int(out)
-                if 0 <= answer < difficulty:
+                # A working executable can still yield an incorrect nonce for
+                # a particular challenge. Verify the actual hash before using
+                # its answer in an authenticated request.
+                if (0 <= answer < difficulty and
+                        deepseek_hash_v1(f"{salt}_{expire_at}_{answer}".encode()) ==
+                        bytes.fromhex(challenge_hex)):
                     return answer
-            detail = (proc.stderr or proc.stdout or "").strip()
-            raise ProofOfWorkError(f"native PoW solver failed: {detail or proc.returncode}")
+            if verbose:
+                print("[pow] native solver returned an invalid result; using Python", file=sys.stderr)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             if verbose:
-                print(f"[pow] native solver unavailable ({exc}); using Python", file=sys.stderr)
+                print(f"[pow] native solver unavailable ({type(exc).__name__}); using Python", file=sys.stderr)
 
     if verbose:
         print("[pow] using slow pure-Python solver", file=sys.stderr)
@@ -903,18 +939,18 @@ class DeepSeekClient:
         timeout: float = 30.0,
         stream_timeout: float = 180.0,
         verbose: bool = False,
+        allow_unauthed: bool = False,
     ) -> None:
         self.token = _normalise_token(token) if token is not None else _read_token()
-        if not self.token:
-            raise AuthenticationError(
-                "No DeepSeek credentials in the system vault. Supply "
-                "DEEPSEEK_TOKEN, DEEPSEEK_TOKEN_FILE, or --token once; a "
-                "successful API call stores it for future unattended use."
-            )
 
         from credential_store import load_credentials
 
         saved_auth = load_credentials()
+        # An explicit token or an environment-provisioned account may differ
+        # from the cached account. Never mix its browser proof, device ID, or
+        # cookies with a different bearer token.
+        if _normalise_token(saved_auth.get("token", "")) != self.token:
+            saved_auth = {}
         self._persist_auth_on_success = bool(
             token is not None
             or os.environ.get("DEEPSEEK_TOKEN", "").strip()
@@ -946,7 +982,8 @@ class DeepSeekClient:
         self.last_accumulator: Optional[CompletionAccumulator] = None
         self.last_file_ids: list[str] = []
 
-        self.session = requests.Session()
+        from request_guard import GuardedSession
+        self.session = GuardedSession(origin=self.base_url)
         raw_cookies = cookies if cookies is not None else os.environ.get("DEEPSEEK_COOKIES", "")
         self.session.cookies.update(saved_auth.get("cookies", {}))
         if raw_cookies:
@@ -957,6 +994,16 @@ class DeepSeekClient:
             else os.environ.get("DEEPSEEK_HIF_LEIM", "").strip()
             or saved_auth.get("hif_leim", "")
         )
+        if not self.token and not allow_unauthed:
+            try:
+                if self._login_with_saved_credentials():
+                    return
+            except (AuthenticationError, requests.RequestException) as exc:
+                raise AuthenticationError("Saved DeepSeek login failed; authenticate again with --login") from exc
+            raise AuthenticationError(
+                "No DeepSeek session token or saved account login. "
+                "Use --login to sign in, or supply DEEPSEEK_TOKEN once."
+            )
 
     # -- headers ---------------------------------------------------------
 
@@ -996,25 +1043,121 @@ class DeepSeekClient:
 
     # -- errors / auth refresh ------------------------------------------
 
+    def login(self, *, email: str = "", mobile: str = "", area_code: str = "", password: str) -> None:
+        """Login once and save account credentials securely for future renewals."""
+        credentials = {
+            "email": email.strip(), "mobile": mobile.strip(),
+            "area_code": area_code.strip(), "password": password,
+        }
+        with _AUTH_REFRESH_LOCK:
+            self._login_with_credentials(credentials, save_login=True)
+
+    def _login_with_saved_credentials(self) -> bool:
+        from credential_store import load_login_credentials
+
+        credentials = load_login_credentials()
+        return self._login_with_credentials(credentials) if credentials else False
+
+    def _login_with_credentials(self, credentials: dict[str, str], *, save_login: bool = False) -> bool:
+        """Exchange account credentials for a fresh DeepSeek Web session token."""
+        email = credentials.get("email", "").strip()
+        mobile = credentials.get("mobile", "").strip()
+        password = credentials.get("password", "")
+        if not password or not (email or mobile):
+            raise AuthenticationError("DeepSeek login requires email/mobile and password")
+        headers = self._headers(referer=f"{self.base_url}/sign_in", extra={"Origin": self.base_url})
+        headers.pop("authorization", None)
+        resp = self.session.post(
+            f"{self.base_url}{LOGIN_PATH}",
+            json={
+                "email": email, "mobile": mobile, "password": password,
+                "area_code": credentials.get("area_code", ""),
+                "device_id": self.device_id, "os": "web",
+            },
+            headers=headers,
+            timeout=self.timeout,
+        )
+        try:
+            if resp.status_code != 200:
+                raise AuthenticationError(f"DeepSeek HTTP login failed (HTTP {resp.status_code})")
+            try:
+                result = resp.json()
+            except ValueError as exc:
+                raise AuthenticationError("DeepSeek HTTP login returned invalid JSON") from exc
+            if not isinstance(result, dict):
+                raise AuthenticationError("Unexpected DeepSeek HTTP login response")
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            if result.get("code") not in (None, 0) or data.get("biz_code") not in (None, 0):
+                raise AuthenticationError("DeepSeek HTTP login was rejected by the server")
+            auth_data = data.get("biz_data") if isinstance(data.get("biz_data"), dict) else {}
+            user = auth_data.get("user") if isinstance(auth_data.get("user"), dict) else {}
+            token = _normalise_token(user.get("token", ""))
+            if not token:
+                raise AuthenticationError("DeepSeek HTTP login returned no token")
+            from credential_store import save_credentials, save_login_credentials
+
+            if save_login and not save_login_credentials(**credentials):
+                raise AuthenticationError("Could not save DeepSeek login in the operating-system keyring")
+            if not save_credentials(token, device_id=self.device_id,
+                                    hif_leim=self.hif_leim, cookies=self.session.cookies.get_dict()):
+                raise AuthenticationError("Could not save DeepSeek token in the operating-system keyring")
+            self.token = token
+            self._persist_auth_on_success = False
+            return True
+        finally:
+            resp.close()
+
     def _reload_token(self) -> bool:
-        new_token = _read_token()
-        if new_token == self.token:
+        with _AUTH_REFRESH_LOCK:
+            from credential_store import load_credentials
+
+            saved = load_credentials()
+            cached_token = _normalise_token(saved.get("token", ""))
+            if cached_token and cached_token != self.token:
+                self.token = cached_token
+                self.hif_leim = saved.get("hif_leim", "")
+                self.device_id = saved.get("device_id", "") or self.device_id
+                self.session.cookies.clear()
+                self.session.cookies.update(saved.get("cookies", {}))
+                return True
+            try:
+                if self._login_with_saved_credentials():
+                    return True
+            except (AuthenticationError, requests.RequestException):
+                pass  # One attempt; the calling request reports its auth failure.
+            # Comet may have renewed its own web session while this gateway
+            # still holds an expired token. Reimport it without a browser.
             try:
                 from import_existing_session import try_import
 
                 if try_import():
-                    from credential_store import load_credentials
-
-                    saved = load_credentials()
-                    new_token = _normalise_token(saved.get("token", ""))
-                    self.hif_leim = saved.get("hif_leim", "") or self.hif_leim
-                    self.device_id = saved.get("device_id", "") or self.device_id
-            except (ImportError, OSError, ValueError):
+                    refreshed = load_credentials()
+                    refreshed_token = _normalise_token(refreshed.get("token", ""))
+                    # Comet can renew its proof, device ID or session cookies
+                    # while keeping the very same bearer token. A rejected
+                    # request must still retry with that refreshed session.
+                    changed = (
+                        refreshed_token != self.token
+                        or refreshed.get("hif_leim", "") != self.hif_leim
+                        or (refreshed.get("device_id", "") or self.device_id) != self.device_id
+                        or refreshed.get("cookies", {}) != self.session.cookies.get_dict()
+                    )
+                    if refreshed_token and changed:
+                        self.token = refreshed_token
+                        self.hif_leim = refreshed.get("hif_leim", "")
+                        self.device_id = refreshed.get("device_id", "") or self.device_id
+                        self.session.cookies.clear()
+                        self.session.cookies.update(refreshed.get("cookies", {}))
+                        return True
+            except (ImportError, OSError, RuntimeError, ValueError):
                 pass
-        if new_token and new_token != self.token:
-            self.token = new_token
-            return True
-        return False
+            replacement = _read_token()
+            if replacement and replacement != self.token:
+                self.token = replacement
+                self.hif_leim = ""
+                self.session.cookies.clear()
+                return True
+            return False
 
     def _persist_valid_credentials(self) -> None:
         if not self._persist_auth_on_success:
@@ -1031,6 +1174,8 @@ class DeepSeekClient:
 
     @staticmethod
     def _is_auth_like(code: Any, message: str) -> bool:
+        if str(code) in {"40001", "40003"}:
+            return True
         text = f"{code} {message}".lower()
         return any(
             word in text
@@ -1058,8 +1203,7 @@ class DeepSeekClient:
         if resp.status_code in (401, 403):
             raise AuthenticationError(
                 f"DeepSeek rejected the credentials (HTTP {resp.status_code}): {message}. "
-                "Update the saved credential by making a successful request with "
-                "a new DEEPSEEK_TOKEN or --token."
+                "Reauthenticate with --login, or supply a valid DEEPSEEK_TOKEN."
             )
         raise DeepSeekAPIError(
             str(message),
@@ -1073,9 +1217,19 @@ class DeepSeekClient:
     # -- generic requests ------------------------------------------------
 
     def _unwrap(self, resp: "requests.Response") -> Any:
-        payload = self._error_payload(resp)
-        if not isinstance(payload, dict):
-            return payload
+        content_type = resp.headers.get("content-type", "").lower()
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if "text/html" in content_type or not isinstance(payload, dict):
+            # An HTTP 200 can carry an intermediary's HTML challenge page or
+            # otherwise malformed JSON, not a successful API response. Stop
+            # before persisting credentials or starting another request.
+            raise DeepSeekAPIError(
+                "DeepSeek returned an unexpected non-API response; check the official website",
+                status=resp.status_code,
+            )
         code = payload.get("code")
         if code not in (None, 0):
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -1117,11 +1271,11 @@ class DeepSeekClient:
                 headers=self._headers(referer=referer),
                 timeout=self.timeout,
             )
-            if resp.status_code in (401, 403) and attempt == 0 and self._reload_token():
-                continue
-            if resp.status_code >= 400:
-                self._raise_http(resp)
             try:
+                if resp.status_code in (401, 403) and attempt == 0 and self._reload_token():
+                    continue
+                if resp.status_code >= 400:
+                    self._raise_http(resp)
                 data = self._unwrap(resp)
                 self._persist_valid_credentials()
                 return data
@@ -1129,6 +1283,8 @@ class DeepSeekClient:
                 if attempt == 0 and self._is_auth_like(exc.code, str(exc)) and self._reload_token():
                     continue
                 raise
+            finally:
+                resp.close()
         raise AuthenticationError("authentication failed after token reload")
 
     # -- public API steps ------------------------------------------------
@@ -1356,12 +1512,21 @@ class DeepSeekClient:
                 resp.close()
                 continue
             if resp.status_code >= 400:
-                self._raise_http(resp)
-                resp.close()
+                try:
+                    self._raise_http(resp)
+                finally:
+                    resp.close()
 
             ctype = resp.headers.get("content-type", "").lower()
             if "text/event-stream" in ctype:
                 return resp, CompletionAccumulator()
+
+            if "text/html" in ctype:
+                resp.close()
+                raise DeepSeekAPIError(
+                    "DeepSeek returned an HTML page instead of a response stream; check the official website",
+                    status=resp.status_code,
+                )
 
             # The API sometimes reports logical errors as 200 + JSON.
             payload = self._error_payload(resp)
@@ -1684,6 +1849,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("prompt", nargs="?", help="User message. Reads stdin when omitted and not a TTY.")
     parser.add_argument("--token", help="Override DEEPSEEK_TOKEN.")
+    parser.add_argument("--login", action="store_true", help="HTTP account login; save the session and login in the OS keyring.")
+    parser.add_argument("--login-web", action="store_true", help="Open the official DeepSeek login page in the chosen browser and save the verified session in the OS keyring (no password collection).")
+    parser.add_argument("--login-browser", choices=("default", "chrome", "msedge", "chromium", "firefox", "webkit"), default="default", help="Browser for --login-web (default: OS default; managed Firefox/Chromium/WebKit supported).")
+    parser.add_argument("--login-timeout", type=float, default=300, help="Seconds to allow interactive login in the browser (default: 300).")
+    parser.add_argument("--email", default="", help="Email used with --login.")
+    parser.add_argument("--mobile", default="", help="Mobile number used with --login.")
+    parser.add_argument("--area-code", default="", help="Mobile dialing code used with --login.")
+    parser.add_argument("--password-stdin", action="store_true", help="With --login, read password from stdin instead of prompting (never as a CLI argument).")
     parser.add_argument("--forget-credentials", action="store_true", help="Delete stored DeepSeek credentials from the OS keyring.")
     parser.add_argument("--device-id", help="Override DEEPSEEK_DEVICE_ID.")
     parser.add_argument("--session-id", help="Continue an existing chat session.")
@@ -1722,6 +1895,50 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         clear_credentials()
         print("Saved DeepSeek credentials removed.")
+        return 0
+
+    if args.login_web:
+        from browser_login import login_in_browser
+
+        print("Opening the official DeepSeek login in your browser. Finish signing in there.", flush=True)
+        try:
+            signed_in = login_in_browser(
+                browser_type=args.login_browser, timeout_seconds=args.login_timeout,
+            )
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            print(f"browser login error: {exc}", file=sys.stderr)
+            return 1
+        if not signed_in:
+            print("browser login error: No verified session was saved. Try --login-web again.", file=sys.stderr)
+            return 1
+        print("DeepSeek session verified and saved in the operating-system keyring.")
+        return 0
+
+    if args.login:
+        if not (args.email or args.mobile):
+            print("auth error: --login requires --email or --mobile", file=sys.stderr)
+            return 2
+        if args.password_stdin:
+            password = sys.stdin.readline().rstrip("\r\n")
+        elif sys.stdin.isatty():
+            password = getpass.getpass("DeepSeek password: ")
+        else:
+            print("auth error: use --password-stdin when no terminal is available", file=sys.stderr)
+            return 2
+        if not password:
+            print("auth error: password must not be empty", file=sys.stderr)
+            return 2
+        try:
+            client = DeepSeekClient(token="", allow_unauthed=True)
+            try:
+                client.login(email=args.email, mobile=args.mobile,
+                             area_code=args.area_code, password=password)
+            finally:
+                client.session.close()
+        except (AuthenticationError, requests.RequestException) as exc:
+            print(f"auth error: {exc}", file=sys.stderr)
+            return 1
+        print("DeepSeek login succeeded; credentials saved in the OS keyring.")
         return 0
 
     prompt = args.prompt

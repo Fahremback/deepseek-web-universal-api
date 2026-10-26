@@ -1,0 +1,159 @@
+{
+  "source": "offline HAR metadata audit",
+  "network_requests_made": 0,
+  "captures": [
+    {
+      "capture": 1,
+      "report": {
+        "total_har_entries": 3,
+        "matching_deepseek_entries": 3,
+        "http_status_counts": {
+          "200": 3
+        },
+        "route_counts": [
+          {
+            "method": "POST",
+            "route": "/api/v0/chat/completion",
+            "count": 1
+          },
+          {
+            "method": "POST",
+            "route": "/api/v0/chat/create_pow_challenge",
+            "count": 1
+          },
+          {
+            "method": "POST",
+            "route": "/api/v0/chat_session/create",
+            "count": 1
+          }
+        ],
+        "known_client_routes_observed": [
+          "/api/v0/chat/completion",
+          "/api/v0/chat/create_pow_challenge",
+          "/api/v0/chat_session/create"
+        ],
+        "known_client_routes_not_observed": [
+          "/api/v0/chat/continue",
+          "/api/v0/file/fetch_files",
+          "/api/v0/file/upload_file",
+          "/api/v0/users/login"
+        ],
+        "other_known_site_routes_observed": [],
+        "api_request_sequence": [
+          {
+            "at": "2026-10-24T16:50:30.713000+00:00",
+            "method": "POST",
+            "route": "/api/v0/chat/create_pow_challenge",
+            "status": 200
+          },
+          {
+            "at": "2026-10-24T16:51:38.536000+00:00",
+            "method": "POST",
+            "route": "/api/v0/chat_session/create",
+            "status": 200
+          },
+          {
+            "at": "2026-10-24T16:51:38.518000+00:00",
+            "method": "POST",
+            "route": "/api/v0/chat/completion",
+            "status": 200
+          }
+        ],
+        "limitations": [
+          "HAR traffic is a sample, not proof of server validation requirements.",
+          "HTTP 200 does not establish future account authorization or compliance.",
+          "No cookies, tokens, payloads, fingerprints or user identities are collected.",
+          "Unobserved routes may be optional, used in different sessions or absent from capture.",
+          "Only a provider can determine the exact reason for account suspension."
+        ]
+      }
+    },
+    {
+      "capture": 2,
+      "report": {
+        "total_har_entries": 64,
+        "matching_deepseek_entries": 29,
+        "http_status_counts": {
+          "200": 27,
+          "202": 1,
+          "307": 1
+        },
+        "route_counts": [
+          {
+            "method": "GET",
+            "route": "/api/v0/client/settings",
+            "count": 5
+          },
+          {
+            "method": "GET",
+            "route": "<other_api_route>",
+            "count": 1
+          },
+          {
+            "method": "GET",
+            "route": "<website_or_static_asset>",
+            "count": 23
+          }
+        ],
+        "known_client_routes_observed": [],
+        "known_client_routes_not_observed": [
+          "/api/v0/chat/completion",
+          "/api/v0/chat/continue",
+          "/api/v0/chat/create_pow_challenge",
+          "/api/v0/chat_session/create",
+          "/api/v0/file/fetch_files",
+          "/api/v0/file/upload_file",
+          "/api/v0/users/login"
+        ],
+        "other_known_site_routes_observed": [
+          "/api/v0/client/settings"
+        ],
+        "api_request_sequence": [
+          {
+            "at": "2026-10-24T16:39:19.350000+00:00",
+            "method": "GET",
+            "route": "/api/v0/client/settings",
+            "status": 200
+          },
+          {
+            "at": "2026-10-24T16:39:19.350000+00:00",
+            "method": "GET",
+            "route": "/api/v0/client/settings",
+            "status": 200
+          },
+          {
+            "at": "2026-10-24T16:39:19.351000+00:00",
+            "method": "GET",
+            "route": "/api/v0/client/settings",
+            "status": 200
+          },
+          {
+            "at": "2026-10-24T16:39:19.351000+00:00",
+            "method": "GET",
+            "route": "/api/v0/client/settings",
+            "status": 200
+          },
+          {
+            "at": "2026-10-24T16:39:19.440000+00:00",
+            "method": "GET",
+            "route": "/api/v0/client/settings",
+            "status": 200
+          },
+          {
+            "at": "2026-10-24T16:39:25.702000+00:00",
+            "method": "GET",
+            "route": "<other_api_route>",
+            "status": 307
+          }
+        ],
+        "limitations": [
+          "HAR traffic is a sample, not proof of server validation requirements.",
+          "HTTP 200 does not establish future account authorization or compliance.",
+          "No cookies, tokens, payloads, fingerprints or user identities are collected.",
+          "Unobserved routes may be optional, used in different sessions or absent from capture.",
+          "Only a provider can determine the exact reason for account suspension."
+        ]
+      }
+    }
+  ]
+}

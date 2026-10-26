@@ -8,14 +8,21 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 from dataclasses import dataclass
+import gzip
+import io
 import json
+import math
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 import uuid
+
+from request_guard import RateLimitPause, RateLimitStateError
 
 from api_client import AuthenticationError, DeepSeekAPIError, DeepSeekClient, ProofOfWorkError
 from anthropic_adapter import normalize_anthropic_request
@@ -90,11 +97,7 @@ def _chat_chunk(model: str, ident: str, timestamp: int, delta: dict[str, Any],
 def _response_object(result: Completion, model: str, ident: str, timestamp: int,
                      previous_response_id: str | None = None, prompt: str = "") -> dict[str, Any]:
     if result.calls:
-        output = [{
-            "type": "function_call", "id": "fc_" + uuid.uuid4().hex,
-            "call_id": call["id"], "name": call["function"]["name"],
-            "arguments": call["function"]["arguments"], "status": "completed",
-        } for call in result.calls]
+        output = [_response_call_item(call) for call in result.calls]
     else:
         output = [{
             "id": "msg_" + uuid.uuid4().hex, "type": "message", "status": "completed",
@@ -110,6 +113,16 @@ def _response_object(result: Completion, model: str, ident: str, timestamp: int,
         "usage": _response_usage(prompt, result) if prompt else None,
         "x_deepseek_usage_estimated": True,
     }
+
+
+def _response_call_item(call: dict[str, Any], pending: bool = False) -> dict[str, Any]:
+    common = {"call_id": call["id"], "name": call["function"]["name"],
+              "status": "in_progress" if pending else "completed"}
+    if call["type"] == "custom":
+        return {"type": "custom_tool_call", "id": "ctc_" + uuid.uuid4().hex,
+                **common, "input": "" if pending else call["input"]}
+    return {"type": "function_call", "id": "fc_" + uuid.uuid4().hex,
+            **common, "arguments": "" if pending else call["function"]["arguments"]}
 
 
 def _assistant_history(result: Completion) -> dict[str, Any]:
@@ -142,12 +155,16 @@ class Gateway(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address: tuple[str, int], api_key: str | None = None,
-                 max_parallel: int = 4, search_enabled: bool = False,
-                 client_factory: Callable[[], DeepSeekClient] = DeepSeekClient):
+                 max_parallel: int = 1, search_enabled: bool = False,
+                 client_factory: Callable[[], DeepSeekClient] = DeepSeekClient,
+                 fallback_url: str | None = None,
+                 fallback_api_key: str | None = None):
         super().__init__(address, GatewayHandler)
         self.api_key = api_key or None
         self.search_enabled = search_enabled
         self.client_factory = client_factory
+        self.fallback_url = fallback_url.rstrip("/") if fallback_url else None
+        self.fallback_api_key = fallback_api_key
         self.slots = threading.BoundedSemaphore(max_parallel)
         self.history_lock = threading.Lock()
         self.response_history: OrderedDict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = OrderedDict()
@@ -172,8 +189,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
     server: Gateway
 
     def log_message(self, format: str, *args: Any) -> None:
-        # Deliberately omit request content, model output, and credentials.
-        print(f"[bridge] {self.client_address[0]} {format % args}", flush=True)
+        # BaseHTTPRequestHandler can log a rejected request line verbatim, which
+        # may contain an unconsumed JSON body or bearer token. Log status only.
+        status = str(args[1]) if format == '"%s" %s %s' and len(args) >= 2 else "error"
+        print(f"[bridge] {self.client_address[0]} HTTP {status}", flush=True)
 
     def _origin_headers(self) -> dict[str, str]:
         origin = self.headers.get("Origin", "")
@@ -205,11 +224,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, status: int, message: str, code: str = "invalid_request_error") -> None:
+    def _error(self, status: int, message: str, code: str = "invalid_request_error",
+               *, extra_headers: dict[str, str] | None = None) -> None:
+        try:
+            cors = self._origin_headers()
+        except RequestError:
+            cors = {}
+        # The body may not have been consumed (e.g. rejected credentials).
+        # Never let a subsequent keep-alive parse treat it as another request.
+        self.close_connection = True
+        cors["Connection"] = "close"
+        if extra_headers:
+            cors.update(extra_headers)
         if self.path.startswith("/v1/messages"):
-            self._json(status, {"type": "error", "error": {"message": message, "type": code}})
+            self._json(status, {"type": "error", "error": {"message": message, "type": code}}, cors)
             return
-        self._json(status, {"error": {"message": message, "type": code, "code": code}})
+        self._json(status, {"error": {"message": message, "type": code, "code": code}}, cors)
 
     def _read_json(self) -> dict[str, Any]:
         try:
@@ -219,12 +249,79 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if length <= 0 or length > MAX_REQUEST_BYTES:
             raise RequestError("Invalid or excessive request size")
         try:
-            obj = json.loads(self.rfile.read(length))
-        except (UnicodeError, ValueError) as exc:
+            body = self.rfile.read(length)
+            encoding = self.headers.get("Content-Encoding", "identity").lower().strip()
+            if encoding == "zstd":
+                import zstandard
+                body = zstandard.ZstdDecompressor().decompress(body, max_output_size=MAX_REQUEST_BYTES)
+            elif encoding == "gzip":
+                # A small compressed payload can expand far beyond the request limit.
+                # Limit decompression itself, before allocating the complete output.
+                with gzip.GzipFile(fileobj=io.BytesIO(body)) as archive:
+                    body = archive.read(MAX_REQUEST_BYTES + 1)
+            elif encoding not in {"identity", ""}:
+                raise RequestError("Unsupported Content-Encoding")
+            if len(body) > MAX_REQUEST_BYTES:
+                raise RequestError("Decompressed request is too large")
+            obj = json.loads(body)
+        except RequestError:
+            raise
+        except (UnicodeError, ValueError, ImportError) as exc:
             raise RequestError("Invalid JSON body") from exc
+        except Exception as exc:
+            if isinstance(exc, RequestError):
+                raise
+            raise RequestError("Invalid compressed JSON body") from exc
         if not isinstance(obj, dict):
             raise RequestError("JSON body must be an object")
         return obj
+
+    def _proxy_to_fallback(self, data: dict[str, Any], cors: dict[str, str]) -> None:
+        """Forward non-DeepSeek models to the original localhost Codex gateway."""
+        hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
+                      "upgrade", "keep-alive", "proxy-connection"}
+        # Browser cookies and proxy credentials belong to the inbound local
+        # connection, never the separately configured upstream gateway.
+        request_excluded = hop_by_hop | {"content-encoding", "accept-encoding",
+                                         "cookie", "proxy-authorization"}
+        excluded = request_excluded | ({"authorization", "x-api-key"}
+                                       if self.server.fallback_api_key is not None else set())
+        headers = {key: value for key, value in self.headers.items()
+                   if key.lower() not in excluded}
+        if self.server.fallback_api_key is not None:
+            headers["Authorization"] = "Bearer " + self.server.fallback_api_key
+        headers["Content-Type"] = "application/json"
+        headers["Accept-Encoding"] = "identity"
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        target = self.server.fallback_url + self.path
+        req = Request(target, data=body, headers=headers, method="POST")
+        try:
+            upstream = urlopen(req, timeout=300)
+        except HTTPError as exc:
+            upstream = exc
+        except URLError:
+            self._error(502, "Original Codex gateway is unavailable", "upstream_error")
+            return
+        with upstream:
+            self.send_response(upstream.status)
+            for key, value in upstream.headers.items():
+                # Keep upstream Content-Encoding paired with its original bytes.
+                # This gateway owns the browser-origin policy, not the fallback.
+                if key.lower() not in hop_by_hop | {"server", "date", "vary"} and not key.lower().startswith("access-control-"):
+                    self.send_header(key, value)
+            vary = upstream.headers.get("Vary", "")
+            if cors and "origin" not in {part.strip().lower() for part in vary.split(",")}:
+                vary = f"{vary}, Origin" if vary else "Origin"
+            if vary:
+                self.send_header("Vary", vary)
+            if cors:
+                self.send_header("Access-Control-Allow-Origin", cors["Access-Control-Allow-Origin"])
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            while chunk := upstream.read1(8192):
+                self.wfile.write(chunk)
+                self.wfile.flush()
 
     def _start_sse(self, origin_headers: dict[str, str]) -> None:
         self.send_response(200)
@@ -273,6 +370,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             cors = self._origin_headers()
+            if self.server.fallback_url and self.headers.get("Upgrade", "").lower() == "websocket":
+                self.send_response(426)
+                self.send_header("Connection", "close")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                self.close_connection = True
+                return
             if self.path.rstrip("/") in {"/health", "/healthz"}:
                 self._json(200, {"status": "ok", "service": "deepseek-web-bridge"}, cors)
                 return
@@ -314,8 +418,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._error(401, "Invalid API key", "authentication_error")
                 return
             data = self._read_json()
-            if not self.server.slots.acquire(blocking=False):
-                self._error(429, "Too many concurrent requests", "rate_limit_error")
+            if self.server.fallback_url and data.get("model") not in MODEL_IDS:
+                self._proxy_to_fallback(data, cors)
+                return
+            # Allow the previous handler a brief interval to finish writing
+            # and release its slot. Responses can reach a local client just
+            # before that release, creating spurious 429s on sequential calls.
+            # This still permits only max_parallel *active* requests.
+            if not self.server.slots.acquire(timeout=0.35):
+                self._error(429, "Too many concurrent requests", "rate_limit_error",
+                            extra_headers={"Retry-After": "1"})
                 return
             try:
                 if self.path.rstrip("/") in {"/v1/chat/completions", "/chat/completions"}:
@@ -337,10 +449,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.server.slots.release()
         except RequestError as exc:
             self._error(400, str(exc))
+        except RateLimitPause as exc:
+            self._error(429, "DeepSeek provider cooldown is active", "rate_limit_error",
+                        extra_headers={"Retry-After": str(math.ceil(exc.retry_after))})
+        except RateLimitStateError:
+            self._error(503, "DeepSeek request-limit state is unavailable", "rate_limit_state_error",
+                        extra_headers={"Retry-After": "60"})
         except AuthenticationError:
             self._error(503, "DeepSeek Web authentication is unavailable", "provider_authentication_error")
-        except (DeepSeekAPIError, ProofOfWorkError, ToolProtocolError) as exc:
-            self._error(502, f"DeepSeek Web: {exc}", "upstream_error")
+        except DeepSeekAPIError as exc:
+            if exc.status == 429:
+                self._error(429, "DeepSeek provider rate limit reached", "rate_limit_error")
+            else:
+                # Upstream error payloads can contain tokens or private prompts.
+                self._error(502, "DeepSeek Web upstream request failed", "upstream_error")
+        except (ProofOfWorkError, ToolProtocolError):
+            # Upstream exception messages may contain responses, prompts or
+            # authentication material. Never reflect them to API clients.
+            self._error(502, "DeepSeek Web upstream request failed", "upstream_error")
         except (BrokenPipeError, ConnectionResetError):
             # Clients may disconnect while the DeepSeek Web stream is active.
             pass
@@ -464,6 +590,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                              "created": timestamp, "model": prepared.model, "choices": [],
                              "usage": _usage(prepared.prompt, result),
                              "x_deepseek_usage_estimated": True})
+        except RateLimitPause as exc:
+            self._event({"error": {"message": "DeepSeek provider cooldown is active",
+                                   "type": "rate_limit_error",
+                                   "retry_after": math.ceil(exc.retry_after)}})
+        except RateLimitStateError:
+            self._event({"error": {"message": "DeepSeek request-limit state is unavailable",
+                                   "type": "rate_limit_state_error", "retry_after": 60}})
+        except DeepSeekAPIError as exc:
+            self._event({"error": {
+                "message": "DeepSeek provider rate limit reached" if exc.status == 429
+                           else "DeepSeek Web generation failed",
+                "type": "rate_limit_error" if exc.status == 429 else "upstream_error",
+            }})
         except Exception:
             self._event({"error": {"message": "DeepSeek Web generation failed", "type": "upstream_error"}})
         self._done()
@@ -484,6 +623,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 }))
                 self._event({"id": ident, "object": "text_completion", "created": now, "model": prepared.model,
                              "choices": [{"index": 0, "text": "", "finish_reason": "stop", "logprobs": None}]})
+            except RateLimitPause as exc:
+                self._event({"error": {"message": "DeepSeek provider cooldown is active",
+                                       "type": "rate_limit_error",
+                                       "retry_after": math.ceil(exc.retry_after)}})
+            except RateLimitStateError:
+                self._event({"error": {"message": "DeepSeek request-limit state is unavailable",
+                                       "type": "rate_limit_state_error", "retry_after": 60}})
+            except DeepSeekAPIError as exc:
+                self._event({"error": {
+                    "message": "DeepSeek provider rate limit reached" if exc.status == 429
+                               else "DeepSeek Web generation failed",
+                    "type": "rate_limit_error" if exc.status == 429 else "upstream_error",
+                }})
             except Exception:
                 self._event({"error": {"message": "DeepSeek Web generation failed", "type": "upstream_error"}})
             self._done()
@@ -533,33 +685,63 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._event({"type": "response.created", "response": provisional}, "response.created")
         self._event({"type": "response.in_progress", "response": provisional}, "response.in_progress")
         try:
+            emitted_item_ids: list[str] = []
             if buffered:
                 for i, call in enumerate((result.calls or [])):
-                    item = {"type": "function_call", "id": "fc_" + uuid.uuid4().hex,
-                            "call_id": call["id"], "name": call["function"]["name"],
-                            "arguments": "", "status": "in_progress"}
+                    item = _response_call_item(call, pending=True)
+                    emitted_item_ids.append(item["id"])
                     self._event({"type": "response.output_item.added", "output_index": i, "item": item},
                                 "response.output_item.added")
-                    args = call["function"]["arguments"]
-                    self._event({"type": "response.function_call_arguments.delta",
-                                 "output_index": i, "delta": args},
-                                "response.function_call_arguments.delta")
-                    self._event({"type": "response.function_call_arguments.done",
-                                 "output_index": i, "arguments": args},
-                                "response.function_call_arguments.done")
-                    item["arguments"] = args
+                    if call["type"] == "custom":
+                        custom_input = call["input"]
+                        self._event({"type": "response.custom_tool_call_input.delta",
+                                     "output_index": i, "delta": custom_input},
+                                    "response.custom_tool_call_input.delta")
+                        self._event({"type": "response.custom_tool_call_input.done",
+                                     "output_index": i, "input": custom_input},
+                                    "response.custom_tool_call_input.done")
+                        item["input"] = custom_input
+                    else:
+                        args = call["function"]["arguments"]
+                        self._event({"type": "response.function_call_arguments.delta",
+                                     "output_index": i, "delta": args},
+                                    "response.function_call_arguments.delta")
+                        self._event({"type": "response.function_call_arguments.done",
+                                     "output_index": i, "arguments": args},
+                                    "response.function_call_arguments.done")
+                        item["arguments"] = args
                     item["status"] = "completed"
                     self._event({"type": "response.output_item.done", "output_index": i, "item": item},
                                 "response.output_item.done")
                 if not result.calls:
-                    self._stream_response_text_item(result.text)
+                    emitted_item_ids.append(self._stream_response_text_item(result.text))
             else:
-                self._stream_response_text_item(None, prepared)
+                emitted_item_ids.append(self._stream_response_text_item(None, prepared))
                 # Text streamed directly, but obtain full final response from _run return.
                 result = self._last_stream_result
             output = _response_object(result, prepared.model, ident, now, prev_id, prepared.prompt)
+            # SSE output_item.added/done and the terminal response must identify
+            # the very same item, including function/custom tool calls.
+            for item, item_id in zip(output["output"], emitted_item_ids):
+                item["id"] = item_id
             self.server.remember(output, all_messages + [_assistant_history(result)])
             self._event({"type": "response.completed", "response": output}, "response.completed")
+        except RateLimitPause as exc:
+            self._event({"type": "response.failed", "error": {
+                "message": "DeepSeek provider cooldown is active", "type": "rate_limit_error",
+                "retry_after": math.ceil(exc.retry_after),
+            }}, "response.failed")
+        except RateLimitStateError:
+            self._event({"type": "response.failed", "error": {
+                "message": "DeepSeek request-limit state is unavailable",
+                "type": "rate_limit_state_error", "retry_after": 60,
+            }}, "response.failed")
+        except DeepSeekAPIError as exc:
+            self._event({"type": "response.failed", "error": {
+                "message": "DeepSeek provider rate limit reached" if exc.status == 429
+                           else "DeepSeek Web generation failed",
+                "type": "rate_limit_error" if exc.status == 429 else "upstream_error",
+            }}, "response.failed")
         except Exception:
             self._event({"type": "response.failed", "error": {
                 "message": "DeepSeek Web generation failed", "type": "upstream_error"
@@ -567,7 +749,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._done()
 
     def _stream_response_text_item(self, completed: str | None,
-                                   prepared: PreparedRequest | None = None) -> None:
+                                   prepared: PreparedRequest | None = None) -> str:
         item_id = "msg_" + uuid.uuid4().hex
         item = {"id": item_id, "type": "message", "role": "assistant",
                 "content": [], "status": "in_progress"}
@@ -597,6 +779,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         item["status"] = "completed"
         self._event({"type": "response.output_item.done", "output_index": 0, "item": item},
                     "response.output_item.done")
+        return item_id
 
     def _handle_anthropic(self, data: dict[str, Any], cors: dict[str, str]) -> None:
         converted = normalize_anthropic_request(data)
@@ -650,6 +833,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
                          "usage": {"output_tokens": _estimate_tokens(
                              result.text or json.dumps(result.calls))}}, "message_delta")
             self._event({"type": "message_stop"}, "message_stop")
+        except RateLimitPause as exc:
+            self._event({"type": "error", "error": {
+                "type": "rate_limit_error", "message": "DeepSeek provider cooldown is active",
+                "retry_after": math.ceil(exc.retry_after),
+            }}, "error")
+        except RateLimitStateError:
+            self._event({"type": "error", "error": {
+                "type": "rate_limit_state_error",
+                "message": "DeepSeek request-limit state is unavailable",
+                "retry_after": 60,
+            }}, "error")
+        except DeepSeekAPIError as exc:
+            self._event({"type": "error", "error": {
+                "type": "rate_limit_error" if exc.status == 429 else "api_error",
+                "message": "DeepSeek provider rate limit reached" if exc.status == 429
+                           else "DeepSeek Web generation failed",
+            }}, "error")
         except Exception:
             self._event({"type": "error", "error": {
                 "type": "api_error", "message": "DeepSeek Web generation failed",
@@ -662,8 +862,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--api-key", default=None, help="Local gateway API key; prefer DEEPSEEK_BRIDGE_API_KEY")
-    parser.add_argument("--max-parallel", type=int, default=4)
+    parser.add_argument("--max-parallel", type=int, default=1)
     parser.add_argument("--search", action="store_true", help="Enable DeepSeek Web built-in search")
+    parser.add_argument("--fallback-url", default=None,
+                        help="Forward other model IDs to an existing local Responses API gateway")
     return parser
 
 
@@ -675,7 +877,9 @@ def main() -> None:
     if args.host not in {"127.0.0.1", "localhost", "::1"} and not api_key:
         raise SystemExit("A gateway API key is required when binding outside localhost")
     server = Gateway((args.host, args.port), api_key=api_key,
-                     max_parallel=args.max_parallel, search_enabled=args.search)
+                     max_parallel=args.max_parallel, search_enabled=args.search,
+                     fallback_url=args.fallback_url,
+                     fallback_api_key=os.environ.get("DEEPSEEK_FALLBACK_API_KEY") or None)
     print(f"DeepSeek Web OpenAI bridge ready at http://{args.host}:{server.server_port}/v1", flush=True)
     try:
         server.serve_forever(poll_interval=0.25)

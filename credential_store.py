@@ -1,8 +1,7 @@
-"""Optional OS credential-vault storage for the DeepSeek Web API session.
+"""DeepSeek session and account login secrets in the operating-system keyring.
 
-No browser dependency. The token must be provided once by an authorized
-account owner, just like an API key. The OS keyring caches it after a valid
-authenticated request, so subsequent requests can run unattended.
+The password is stored in a separate vault entry so rotating a session token
+never overwrites or exposes account login details.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ from typing import Any
 
 SERVICE = "DeepSeekWebClient"
 ACCOUNT = "api-credentials"
+LOGIN_ACCOUNT = "account-login"
 
 
 def load_credentials() -> dict[str, Any]:
@@ -63,10 +63,53 @@ def save_credentials(
         return False
 
 
+def load_login_credentials() -> dict[str, str]:
+    """Read an explicitly provisioned email/mobile and password from the vault."""
+    try:
+        import keyring
+
+        raw = keyring.get_password(SERVICE, LOGIN_ACCOUNT)
+        data = json.loads(raw) if raw else {}
+        if isinstance(data, dict) and isinstance(data.get("password"), str):
+            return {
+                "email": str(data.get("email") or ""),
+                "mobile": str(data.get("mobile") or ""),
+                "area_code": str(data.get("area_code") or ""),
+                "password": data["password"],
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def save_login_credentials(
+    *, email: str = "", mobile: str = "", area_code: str = "", password: str
+) -> bool:
+    """Provision unattended HTTP login without writing the password to disk."""
+    if not password or not (email.strip() or mobile.strip()):
+        return False
+    try:
+        import keyring
+
+        keyring.set_password(SERVICE, LOGIN_ACCOUNT, json.dumps({
+            "email": email.strip(),
+            "mobile": mobile.strip(),
+            "area_code": area_code.strip(),
+            "password": password,
+        }))
+        return True
+    except Exception:
+        return False
+
+
 def clear_credentials() -> None:
     try:
         import keyring
 
-        keyring.delete_password(SERVICE, ACCOUNT)
+        for account in (ACCOUNT, LOGIN_ACCOUNT):
+            try:
+                keyring.delete_password(SERVICE, account)
+            except Exception:
+                pass
     except Exception:
         pass

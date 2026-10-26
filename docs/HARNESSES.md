@@ -27,7 +27,58 @@ python openai_server.py
 
 Os clientes precisam enviar essa chave no cabeçalho `Authorization: Bearer` (OpenAI) ou `x-api-key` (Anthropic). Por padrão o servidor escuta apenas `127.0.0.1`. Escutar em outra interface exige uma chave. O tráfego HTTP não é criptografado; não o exponha diretamente à internet.
 
+Para encaminhar modelos que não sejam DeepSeek para um gateway OpenAI/Responses já existente, use `--fallback-url`. Quando esse destino exige uma chave **diferente** da chave local, configure `DEEPSEEK_FALLBACK_API_KEY` no ambiente do processo. A chave de fallback substitui o cabeçalho Authorization somente nas chamadas encaminhadas; os modelos DeepSeek continuam usando a sessão do cofre do Windows. Sem essa variável, a autorização do cliente é mantida para compatibilidade com gateways que usam a mesma chave.
+
+Quando um cliente no navegador usa uma origem local permitida, a mesma política CORS do gateway é aplicada também às respostas encaminhadas ao fallback, inclusive erros HTTP e SSE.
+
+Mesmo quando o gateway original utiliza a mesma chave de API, cookies locais e credenciais de proxy (`Cookie` e `Proxy-Authorization`) nunca são repassados ao fallback.
+
 ## Configuração em um harness
+
+### Codex CLI com ciclo de vida gerenciado
+
+O comando `python run_codex.py -- exec "Sua tarefa"` configura o Codex CLI
+somente para esta execução com um provedor `deepseek_web_local` do tipo
+`responses`. Também é possível executar `python run_codex.py` para a interface
+interativa. A configuração é passada por argumentos `-c`, sem alterar a
+configuração global ou interromper outros proxies e modelos do usuário.
+
+O gateway fica acessível apenas em `127.0.0.1`, recebe uma chave local temporária
+via variável de ambiente compartilhada exclusivamente com o subprocesso Codex,
+e é encerrado no final. O iniciador usa `Gateway(("127.0.0.1", 0))` dentro do
+próprio processo para reservar atomicamente a porta até o encerramento; não há
+intervalo de exposição entre escolher uma porta livre e iniciar o servidor.
+Não é necessário iniciar um subprocesso Python adicional nem consultar `/health`
+para verificar uma porta que poderia ter sido ocupada por outro processo.
+
+Para respostas HTTP normais, o gateway comunica uma pausa local com HTTP 429
+e `Retry-After`. Em streaming SSE, após enviar os cabeçalhos HTTP 200, não é
+possível alterar o status: o cliente deve ler eventos `response.failed` (API
+Responses) ou mensagens `error` (Chat Completions). Uma pausa é sinalizada
+com `type=rate_limit_error` e inclui `retry_after` quando conhecido. Um 429
+remoto também recebe o tipo `rate_limit_error`, sem repassar a mensagem bruta
+do provedor.
+O mesmo tratamento de pausa vale para SSE de `POST /v1/completions` (legado)
+e `POST /v1/messages` (Anthropic): os eventos de erro incluem
+`type=rate_limit_error` e `retry_after` quando o tempo de pausa local é conhecido.
+O gateway aguarda no máximo 350 ms pela vaga de concorrência, mantendo o
+limite de uma requisição ativa por padrão. Se ela não liberar, devolve
+HTTP 429 com `Retry-After: 1`, sem iniciar uma geração adicional.
+O `run_codex.py` ativa um limite específico de até 1.000.000 de caracteres
+no prompt preparado durante a sua sessão, necessário para instruções e
+catálogos de ferramentas grandes. O gateway comum conserva seu limite de
+200.000 caracteres, e a variável temporária é restaurada quando o Codex sai.
+Quando o estado persistido dos limites locais está inacessível, os endpoints
+JSON devolvem HTTP 503 com `Retry-After: 60`. Se o streaming SSE já começou,
+os eventos de erro usam `type=rate_limit_state_error` e `retry_after=60`, sem
+detalhes de arquivos ou mensagens internas.
+O comando pressupõe que o Codex CLI esteja **executável** no `PATH` e que uma
+sessão válida esteja configurada no cofre do sistema. A descoberta verifica
+`codex --version`, evitando atalhos incompatíveis (por exemplo, um shim npm do
+Windows visto pelo WSL sem Node.js). Além dos testes simulados, o iniciador foi
+testado com `codex --help` real no Windows, com saída 0 e a porta liberada após
+a sessão. Isso não substitui um teste remoto real de Responses nem configura o
+aplicativo Codex Desktop.
 
 Para sistemas que aceitam **OpenAI-compatible**:
 
@@ -101,6 +152,8 @@ Para `response_format` de Chat Completions ou `text.format` de Responses com `js
 | `POST /v1/messages/count_tokens` | Estimativa local de tokens (não contagem real) |
 
 Na Responses API, `previous_response_id` recompõe as mensagens anteriores de um cache em memória limitado a 256 respostas, perdido quando o serviço reinicia. Em Chat Completions, o cliente deve mandar o histórico completo em `messages`, como exige o protocolo comum; o gateway abre uma conversa DeepSeek Web nova por solicitação.
+
+Resultados de ferramentas na Responses API exigem `call_id` não vazio e aceitam `output` como texto ou lista de partes de conteúdo suportadas (por exemplo, `input_text`). A lista é convertida pela camada normal de conteúdo; não é serializada como representação textual Python.
 
 ## Mídia
 

@@ -10,6 +10,7 @@ import base64
 import binascii
 from dataclasses import dataclass, field
 import json
+import os
 import re
 import uuid
 from typing import Any
@@ -17,6 +18,7 @@ from typing import Any
 
 MAX_MESSAGES = 256
 MAX_PROMPT_CHARS = 200_000
+CODEX_MAX_PROMPT_CHARS = 1_000_000
 MAX_ATTACHMENTS = 12
 MAX_FILE_BYTES = 12 * 1024 * 1024
 MAX_TOTAL_FILE_BYTES = 32 * 1024 * 1024
@@ -61,8 +63,13 @@ def normalize_tools(tools: Any) -> list[dict[str, Any]]:
     result = []
     names = set()
     for raw in tools:
-        if not isinstance(raw, dict) or raw.get("type", "function") != "function":
-            raise RequestError("Only function tools are supported")
+        if not isinstance(raw, dict):
+            raise RequestError("Invalid tool definition")
+        wire_type = raw.get("type", "function")
+        if wire_type not in {"function", "custom"}:
+            # Hosted tools (for example web_search) are executed by their provider,
+            # not by this local gateway; never offer them as executable functions.
+            continue
         data = raw.get("function", raw)
         if not isinstance(data, dict):
             raise RequestError("Invalid function tool")
@@ -72,13 +79,17 @@ def normalize_tools(tools: Any) -> list[dict[str, Any]]:
         if name in names:
             raise RequestError(f"Duplicate function name: {name}")
         names.add(name)
-        params = data.get("parameters", {"type": "object", "properties": {}})
+        params = (data.get("parameters", {"type": "object", "properties": {}})
+                  if wire_type == "function" else
+                  {"type": "object", "properties": {"input": {"type": "string"}},
+                   "required": ["input"], "additionalProperties": False})
         if not isinstance(params, dict):
             raise RequestError(f"Invalid parameters for {name}")
         result.append({
             "name": name,
             "description": str(data.get("description", ""))[:2000],
             "parameters": params,
+            "wire_type": wire_type,
         })
     return result
 
@@ -92,7 +103,7 @@ def normalize_tool_choice(value: Any, tools: list[dict[str, Any]]) -> Any:
         if value == "required" and not tools:
             raise RequestError("tool_choice=required needs tools")
         return value
-    if isinstance(value, dict) and value.get("type") == "function":
+    if isinstance(value, dict) and value.get("type") in {"function", "custom"}:
         data = value.get("function", value)
         name = data.get("name") if isinstance(data, dict) else None
         if not isinstance(name, str) or name not in {t["name"] for t in tools}:
@@ -232,7 +243,12 @@ def _build_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]], c
     lines.append("MESSAGES_JSONL:")
     lines.extend(json.dumps(m, ensure_ascii=False, separators=(",", ":")) for m in messages)
     prompt = "\n".join(lines)
-    if len(prompt) > MAX_PROMPT_CHARS:
+    # The Codex launcher creates its HTTP gateway in this Python process.
+    # Therefore the bridge setting must be evaluated when a request arrives,
+    # not just once during module import.
+    limit = (CODEX_MAX_PROMPT_CHARS if os.environ.get("DEEPSEEK_CODEX_BRIDGE") == "1"
+             else MAX_PROMPT_CHARS)
+    if len(prompt) > limit:
         raise RequestError("Prompt exceeds maximum size")
     return prompt
 
@@ -296,7 +312,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], choice: Any) -> lis
     try:
         obj = json.loads(raw)
     except (ValueError, TypeError):
-        return None
+        obj = _parse_dsml_tool_calls(text, tools)
     if not isinstance(obj, dict):
         return None
     calls = obj.get("calls", obj.get("tool_calls"))
@@ -314,19 +330,61 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], choice: Any) -> lis
         if name not in by_name or (isinstance(choice, dict) and name != choice["name"]):
             return None
         args = func.get("arguments", {})
-        if isinstance(args, str):
+        if isinstance(args, str) and by_name[name].get("wire_type") == "custom":
+            args = {"input": args}
+        elif isinstance(args, str):
             try:
                 args = json.loads(args)
             except ValueError:
                 return None
         if not isinstance(args, dict) or not _basic_schema_check(args, by_name[name]["parameters"]):
             return None
+        wire_type = by_name[name].get("wire_type", "function")
         parsed.append({
             "id": "call_" + uuid.uuid4().hex[:24],
-            "type": "function",
+            "type": wire_type,
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))},
+            **({"input": args["input"]} if wire_type == "custom" else {}),
         })
     return parsed
+
+
+def _parse_dsml_tool_calls(text: str, tools: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Decode the native DeepSeek Web DSML tool syntax into the same call schema."""
+    start = re.escape("<｜｜DSML｜｜ invoke")
+    end = re.escape("</｜｜DSML｜｜ invoke>")
+    pattern = start + r'\s+name="([\w.-]{1,64})"\s*>(.*?)' + end
+    params_open = re.escape("<｜｜DSML｜｜ parameter")
+    params_end = re.escape("</｜｜DSML｜｜ parameter>")
+    params_pattern = params_open + r'\s+name="([\w.-]{1,64})"([^>]*)>(.*?)' + params_end
+    calls = []
+    by_name = {tool["name"]: tool for tool in tools}
+    for match in re.finditer(pattern, text, re.S):
+        name, content = match.groups()
+        if name not in by_name:
+            return None
+        arguments: dict[str, Any] = {}
+        for param in re.finditer(params_pattern, content, re.S):
+            key, attrs, value = param.groups()
+            if key in arguments:
+                return None
+            if 'string="true"' not in attrs:
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    pass
+            arguments[key] = value
+        if not arguments:
+            return None
+        if by_name[name].get("wire_type") == "custom":
+            # Custom Responses tools consume a string. Preserve a lone raw input,
+            # otherwise serialize DeepSeek's named parameters as the tool input.
+            tool_input = (arguments["input"] if set(arguments) == {"input"} and
+                          isinstance(arguments["input"], str) else
+                          json.dumps(arguments, ensure_ascii=False, separators=(",", ":")))
+            arguments = {"input": tool_input}
+        calls.append({"name": name, "arguments": arguments})
+    return {"calls": calls} if calls else None
 
 
 def normalize_responses_input(data: dict[str, Any], previous: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -339,14 +397,25 @@ def normalize_responses_input(data: dict[str, Any], previous: list[dict[str, Any
             if not isinstance(item, dict):
                 raise RequestError("Invalid Responses input")
             typ = item.get("type")
-            if typ == "function_call_output":
-                messages.append({"role": "tool", "tool_call_id": item.get("call_id"),
-                                 "content": str(item.get("output", ""))})
-            elif typ == "function_call":
+            if typ in {"function_call_output", "custom_tool_call_output"}:
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    raise RequestError("Tool output must have a nonempty call_id")
+                output = item.get("output")
+                if not isinstance(output, (str, list)):
+                    raise RequestError("Tool output must be text or a content-part array")
+                messages.append({"role": "tool", "tool_call_id": call_id,
+                                 "content": output})
+            elif typ in {"function_call", "custom_tool_call"}:
+                call_id, name = item.get("call_id"), item.get("name")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    raise RequestError("Tool call must have a nonempty call_id")
+                if not isinstance(name, str) or not name.strip():
+                    raise RequestError("Tool call must have a nonempty name")
                 messages.append({"role": "assistant", "content": None, "tool_calls": [{
-                    "id": item.get("call_id"),
-                    "type": "function",
-                    "function": {"name": item.get("name"), "arguments": item.get("arguments", "{}")},
+                    "id": call_id,
+                    "type": typ,
+                    "function": {"name": name, "arguments": item.get("arguments", item.get("input", ""))},
                 }]})
             elif item.get("role") in {"system", "developer", "user", "assistant", "tool"}:
                 messages.append({"role": item["role"], "content": item.get("content"),
