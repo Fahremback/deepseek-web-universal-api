@@ -9,6 +9,12 @@ client, not DeepSeek's commercial API.
 
 ## Quick start
 
+**Codex com DeepSeek no Windows (já configurado):** abra o arquivo
+`Abrir Codex DeepSeek.cmd` com dois cliques. Ele inicia o Codex CLI usando
+o DeepSeek Web e encerra o gateway local ao sair. Para um comando direto,
+use `python run_codex.py`. Não é necessário alterar a configuração global do
+Codex. É necessário manter a sessão do DeepSeek válida.
+
 ```powershell
 git clone https://github.com/Fahremback/deepseek-web-universal-api.git
 cd deepseek-web-universal-api
