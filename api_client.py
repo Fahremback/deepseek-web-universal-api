@@ -1633,7 +1633,7 @@ class DeepSeekClient:
                 for event, data in iter_sse(resp.iter_lines(chunk_size=1024)):
                     before_title = acc.title
                     delta_text, delta_think = acc.feed(event, data)
-                    if event == "close" and acc.status not in ("FINISHED", "INCOMPLETE"):
+                    if acc.closed and acc.status not in ("FINISHED", "INCOMPLETE"):
                         raise DeepSeekAPIError(
                             f"DeepSeek closed generation with non-terminal status: {acc.status or 'unknown'}"
                         )

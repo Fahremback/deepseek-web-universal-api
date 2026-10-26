@@ -63,6 +63,31 @@ data: {}
 
 
 class AutoContinueTests(unittest.TestCase):
+    def test_done_marker_with_nonterminal_status_is_rejected(self):
+        partial = '''data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[{"type":"RESPONSE","content":"partial"}]}}}
+
+data: [DONE]
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(partial), CompletionAccumulator())):
+            with self.assertRaisesRegex(DeepSeekAPIError, "WIP"):
+                list(client.stream_completion(chat_session_id="session", prompt="long"))
+        client.session.close()
+
+    def test_done_marker_with_finished_status_is_accepted(self):
+        finished = '''data: {"v":{"response":{"message_id":2,"status":"FINISHED","fragments":[{"type":"RESPONSE","content":"complete"}]}}}
+
+data: [DONE]
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(finished), CompletionAccumulator())):
+            chunks = list(client.stream_completion(chat_session_id="session", prompt="short"))
+        self.assertEqual("".join(chunk.text for chunk in chunks), "complete")
+        self.assertEqual(client.last_accumulator.status, "FINISHED")
+        client.session.close()
+
     def test_close_while_still_generating_does_not_complete(self):
         partial = '''event: ready
 data: {"request_message_id":1,"response_message_id":2}
