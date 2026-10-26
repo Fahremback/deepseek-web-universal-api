@@ -608,7 +608,7 @@ def iter_sse(lines: Iterable[Any]) -> Iterator[tuple[str, str]]:
         line = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
         line = line.rstrip("\r")
         if line == "":
-            if data:
+            if data or event in ("close", "error"):
                 yield event, "\n".join(data)
             event = "message"
             data = []
@@ -620,7 +620,7 @@ def iter_sse(lines: Iterable[Any]) -> Iterator[tuple[str, str]]:
         elif line.startswith("data:"):
             data.append(line[5:].lstrip())
         # Other SSE fields (id:, retry:) are unused by this API.
-    if data:
+    if data or event in ("close", "error"):
         yield event, "\n".join(data)
 
 

@@ -63,6 +63,31 @@ data: {}
 
 
 class AutoContinueTests(unittest.TestCase):
+    def test_close_event_without_data_finishes_stream(self):
+        finished = '''data: {"v":{"response":{"message_id":2,"status":"FINISHED","fragments":[{"type":"RESPONSE","content":"ready"}]}}}
+
+event: close
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(finished), CompletionAccumulator())):
+            chunks = list(client.stream_completion(chat_session_id="session", prompt="short"))
+        self.assertEqual("".join(chunk.text for chunk in chunks), "ready")
+        self.assertEqual([chunk.done for chunk in chunks], [False, True])
+        client.session.close()
+
+    def test_error_event_without_data_is_not_ignored(self):
+        stream = '''data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[]}}}
+
+event: error
+
+'''
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(stream), CompletionAccumulator())):
+            with self.assertRaisesRegex(DeepSeekAPIError, "stream error"):
+                list(client.stream_completion(chat_session_id="session", prompt="short"))
+        client.session.close()
+
     def test_corrupt_message_patch_is_not_silently_ignored(self):
         corrupt = '''data: {"v":{"response":{"status":"WIP","fragments":[{"type":"RESPONSE","content":"part"}]}}}
 
