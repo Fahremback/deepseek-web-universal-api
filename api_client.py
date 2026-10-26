@@ -1638,7 +1638,7 @@ class DeepSeekClient:
                             f"DeepSeek closed generation with non-terminal status: {acc.status or 'unknown'}"
                         )
                     title = acc.title if acc.title != before_title else None
-                    if delta_text or delta_think or title or event in ("ready", "title", "close"):
+                    if delta_text or delta_think or title or acc.closed or event in ("ready", "title"):
                         yield StreamChunk(
                             event=event,
                             text=delta_text,

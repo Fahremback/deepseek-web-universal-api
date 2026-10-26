@@ -86,6 +86,22 @@ data: [DONE]
             chunks = list(client.stream_completion(chat_session_id="session", prompt="short"))
         self.assertEqual("".join(chunk.text for chunk in chunks), "complete")
         self.assertEqual(client.last_accumulator.status, "FINISHED")
+        self.assertEqual([chunk.done for chunk in chunks if chunk.done], [True])
+        client.session.close()
+
+    def test_incomplete_done_marker_continues_and_emits_final_done(self):
+        initial = INITIAL.replace("event: close\ndata: {}", "data: [DONE]")
+        finished = CONTINUED.replace("event: close\ndata: {}", "data: [DONE]")
+        self.assertNotEqual(initial, INITIAL)
+        self.assertNotEqual(finished, CONTINUED)
+        client = DeepSeekClient(token="test-token")
+        with patch.object(client, "create_completion_stream", return_value=(FakeSSE(initial), CompletionAccumulator())):
+            with patch.object(client, "continue_completion_stream", return_value=FakeSSE(finished)) as continuation:
+                chunks = list(client.stream_completion(chat_session_id="session", prompt="long"))
+        self.assertEqual("".join(chunk.text for chunk in chunks), "Parte final")
+        self.assertEqual([chunk.done for chunk in chunks if chunk.event == "message" and chunk.raw == "[DONE]"], [False, True])
+        self.assertEqual(client.last_accumulator.continuations, 1)
+        continuation.assert_called_once_with(chat_session_id="session", message_id=2)
         client.session.close()
 
     def test_close_while_still_generating_does_not_complete(self):
