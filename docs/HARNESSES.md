@@ -28,6 +28,7 @@ python openai_server.py
 Os clientes precisam enviar essa chave no cabeçalho `Authorization: Bearer` (OpenAI) ou `x-api-key` (Anthropic). Por padrão o servidor escuta apenas `127.0.0.1`. Escutar em outra interface exige uma chave. O tráfego HTTP não é criptografado; não o exponha diretamente à internet.
 
 Para encaminhar modelos que não sejam DeepSeek para um gateway OpenAI/Responses já existente, use `--fallback-url`. Quando esse destino exige uma chave **diferente** da chave local, configure `DEEPSEEK_FALLBACK_API_KEY` no ambiente do processo. A chave de fallback substitui o cabeçalho Authorization somente nas chamadas encaminhadas; os modelos DeepSeek continuam usando a sessão do cofre do Windows. Sem essa variável, a autorização do cliente é mantida para compatibilidade com gateways que usam a mesma chave.
+O endereço de fallback precisa ser uma **origem local explícita com porta** (por exemplo, `http://127.0.0.1:8001`); URLs externas, com credenciais, caminho, parâmetros ou fragmento são recusadas. O encaminhamento não consulta proxies definidos por variáveis de ambiente nem segue redirecionamentos HTTP, impedindo que um fallback local redirecione a solicitação autenticada para outro servidor. Uma resposta 3xx é preservada para o cliente, sem ser seguida pelo gateway.
 
 Quando um cliente no navegador usa uma origem local permitida, a mesma política CORS do gateway é aplicada também às respostas encaminhadas ao fallback, inclusive erros HTTP e SSE.
 

@@ -19,7 +19,8 @@ import threading
 import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 import uuid
 
 from request_guard import RateLimitPause, RateLimitStateError
@@ -33,6 +34,33 @@ from harness_adapter import (
 
 
 MAX_REQUEST_BYTES = 48 * 1024 * 1024
+
+
+def _validate_fallback_url(url: str | None) -> str | None:
+    """Only allow a local API origin, never a credential-bearing remote URL."""
+    if url is None:
+        return None
+    if not isinstance(url, str):
+        raise ValueError("Fallback URL must be a localhost HTTP origin")
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("Invalid fallback URL") from exc
+    if (parts.scheme.lower() not in {"http", "https"}
+            or parts.hostname not in {"localhost", "127.0.0.1", "::1"}
+            or port is None or not 1 <= port <= 65535
+            or parts.username is not None or parts.password is not None
+            or parts.path not in {"", "/"} or parts.query or parts.fragment):
+        raise ValueError("Fallback URL must be a localhost HTTP origin with a port")
+    return url.rstrip("/")
+
+
+class _NoFallbackRedirect(HTTPRedirectHandler):
+    """Never forward fallback credentials to a redirected origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 @dataclass
@@ -159,11 +187,12 @@ class Gateway(ThreadingHTTPServer):
                  client_factory: Callable[[], DeepSeekClient] = DeepSeekClient,
                  fallback_url: str | None = None,
                  fallback_api_key: str | None = None):
+        safe_fallback_url = _validate_fallback_url(fallback_url)
         super().__init__(address, GatewayHandler)
         self.api_key = api_key or None
         self.search_enabled = search_enabled
         self.client_factory = client_factory
-        self.fallback_url = fallback_url.rstrip("/") if fallback_url else None
+        self.fallback_url = safe_fallback_url
         self.fallback_api_key = fallback_api_key
         self.slots = threading.BoundedSemaphore(max_parallel)
         self.history_lock = threading.Lock()
@@ -296,7 +325,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         target = self.server.fallback_url + self.path
         req = Request(target, data=body, headers=headers, method="POST")
         try:
-            upstream = urlopen(req, timeout=300)
+            # Disable proxy environment settings and redirects for the local
+            # fallback: neither may relocate this authenticated HTTP request.
+            upstream = build_opener(ProxyHandler({}), _NoFallbackRedirect()).open(req, timeout=300)
         except HTTPError as exc:
             upstream = exc
         except URLError:

@@ -24,6 +24,12 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if data.get("redirect_target"):
+            self.send_response(302)
+            self.send_header("Location", data["redirect_target"])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.server.received.append({
             "path": self.path,
             "data": data,
@@ -66,6 +72,55 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
 
 class TestFallbackRouting(unittest.TestCase):
+    def test_fallback_target_must_be_local_http_origin(self):
+        disallowed = (
+            "https://external.example.invalid/v1", "http://192.0.2.17:8000",
+            "http://127.0.0.1.evil.invalid:8000", "http://user:pass@localhost:9999",
+            "http://localhost:8000/v1", "http://localhost:8000?token=secret",
+            "http://localhost:8000/#fragment", "ftp://127.0.0.1:8000",
+            "http://localhost:0", "http://localhost:99999",
+        )
+        for address in disallowed:
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                Gateway(("127.0.0.1", 0), fallback_url=address)
+        for address in ("http://localhost:8000", "http://127.0.0.1:12345",
+                        "http://[::1]:7777", "https://localhost:8443"):
+            with self.subTest(address=address):
+                gateway = Gateway(("127.0.0.1", 0), fallback_url=address)
+                try:
+                    self.assertEqual(gateway.fallback_url, address)
+                finally:
+                    gateway.server_close()
+
+    def test_fallback_does_not_follow_redirect_with_gateway_credentials(self):
+        """A local fallback's redirect must not cause a second HTTP request."""
+        class TargetHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                self.server.hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        target.hits = []
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        target_thread.start()
+        try:
+            result = requests.post(self.url, json={
+                "model": "gpt-original", "input": "test",
+                "redirect_target": f"http://127.0.0.1:{target.server_port}/redirected",
+            }, headers={"Authorization": "Bearer local-secret"},
+                                   allow_redirects=False, timeout=3)
+            self.assertEqual(result.status_code, 302)
+            self.assertFalse(target.hits)
+        finally:
+            target.shutdown()
+            target.server_close()
+            target_thread.join(timeout=3)
+
     @classmethod
     def setUpClass(cls):
         cls.original = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
